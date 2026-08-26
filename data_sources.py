@@ -1,125 +1,216 @@
 from __future__ import annotations
 
 import io
+import json
+import os
+import re
 import zipfile
-import xml.etree.ElementTree as ET
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from datetime import date, datetime
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta, date
+from pathlib import Path
+from typing import Any, Optional, Dict
 
+import numpy as np
 import pandas as pd
 import requests
-import streamlit as st
+import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 
-DART_BASE = "https://opendart.fss.or.kr/api"
-ECOS_BASE = "https://ecos.bok.or.kr/api"
+try:
+    import streamlit as st
+except Exception:
+    st = None
+
+BASE_URL = "https://opendart.fss.or.kr/api"
+DART_BASE = BASE_URL
+DART_VIEWER = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
+REPORT_CODES = {
+    "annual": "11011",
+    "semiannual": "11012",
+    "q1": "11013",
+    "q3": "11014",
+}
+
+class OpenDartError(RuntimeError):
+    pass
 
 
-def _request_json(url: str, params: dict, timeout: int = 30) -> dict:
-    r = requests.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("status") not in (None, "000"):
-        raise RuntimeError(f"API error {data.get('status')}: {data.get('message')}")
-    return data
+@dataclass
+class Company:
+    corp_code: str
+    corp_name: str
+    stock_code: Optional[str] = None
+    corp_cls: Optional[str] = None
+    ceo_nm: Optional[str] = None
+    jurir_no: Optional[str] = None
+    homepage: Optional[str] = None
+    adres: Optional[str] = None
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def _load_corp_codes(api_key: str) -> pd.DataFrame:
-    # OpenDART's English API provides a JSON corporation-code endpoint.
-    # It avoids downloading/parsing the large ZIP/XML payload used by corpCode.xml.
-    url = "https://engopendart.fss.or.kr/engapi/corpCode.json"
-    session = requests.Session()
-    retry = Retry(total=3, connect=3, read=3, backoff_factor=0.6,
-                  status_forcelist=[429, 500, 502, 503, 504],
-                  allowed_methods=["GET"], raise_on_status=False)
-    session.mount("https://", HTTPAdapter(max_retries=retry))
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; OpenDART Feature Engine/1.0)",
-        "Accept": "application/json,text/plain,*/*",
-    })
+class OpenDartClient:
+    def __init__(self, api_key: str, timeout: int = 30):
+        if not api_key or len(api_key) < 20:
+            raise ValueError("OPENDART_API_KEY가 필요합니다.")
+        self.api_key = api_key
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "OpenDART-Valuation-Agent/1.0"})
+        self._corp_codes: Optional[pd.DataFrame] = None
 
-    last_error = None
-    for timeout in (10, 20, 40):
-        try:
-            raw = session.get(url, params={"crtfc_key": api_key}, timeout=(5, timeout))
-            raw.raise_for_status()
-            data = raw.json()
-            if str(data.get("status", "000")) != "000":
-                raise RuntimeError(f"OpenDART corporation-code API error {data.get('status')}: {data.get('message')}")
-            rows = data.get("list", [])
-            df = pd.DataFrame(rows)
-            if df.empty:
-                raise RuntimeError("OpenDART corporation-code API returned no companies.")
-            for col, width in (("corp_code", 8), ("stock_code", 6)):
-                if col in df.columns:
-                    df[col] = df[col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(width)
-            return df
-        except Exception as exc:
-            last_error = exc
-    raise RuntimeError(f"OpenDART corporation-code lookup failed after retries: {last_error}")
-
-
-class OpenDARTClient:
-    def __init__(self, api_key: str):
-        self.api_key = api_key.strip()
-
-    def resolve_company(self, query: str) -> Optional[dict]:
-        df = _load_corp_codes(self.api_key)
-        q = query.strip().lower()
-        names = df["corp_name"].astype(str)
-        exact = df[names.str.lower().eq(q)]
-        if exact.empty:
-            exact = df[names.str.lower().str.contains(q, na=False)]
-        if exact.empty:
-            return None
-        row = exact.iloc[0].to_dict()
-        row["corp_code"] = str(row.get("corp_code", "")).zfill(8)
-        row["stock_code"] = str(row.get("stock_code", "")).zfill(6)
-        return {k: (None if pd.isna(v) else v) for k, v in row.items()}
-
-    def get_company_info(self, corp_code: str) -> dict:
-        corp_code = str(corp_code).zfill(8)
-        data = _request_json(f"{DART_BASE}/company.json", {"crtfc_key": self.api_key, "corp_code": corp_code})
-        return {k: v for k, v in data.items() if k not in {"status", "message"}}
-
-    def get_financials(self, corp_code: str, year: int) -> pd.DataFrame:
-        corp_code = str(corp_code).zfill(8)
-        params = {
-            "crtfc_key": self.api_key,
-            "corp_code": corp_code,
-            "bsns_year": str(year),
-            "reprt_code": "11011",
-            "fs_div": "CFS",
-        }
-        r = requests.get(f"{DART_BASE}/fnlttSinglAcntAll.json", params=params, timeout=30)
+    def _get_json(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
+        params = {"crtfc_key": self.api_key, **params}
+        r = self.session.get(f"{BASE_URL}/{endpoint}.json", params=params, timeout=self.timeout)
         r.raise_for_status()
         data = r.json()
-        if data.get("status") != "000":
-            params["fs_div"] = "OFS"
-            r = requests.get(f"{DART_BASE}/fnlttSinglAcntAll.json", params=params, timeout=30)
-            r.raise_for_status()
-            data = r.json()
+        if str(data.get("status")) != "000":
+            raise OpenDartError(f"OpenDART 오류 {data.get('status')}: {data.get('message')}")
+        return data
+
+    def download_binary(self, endpoint: str, params: dict[str, Any]) -> bytes:
+        params = {"crtfc_key": self.api_key, **params}
+        r = self.session.get(f"{BASE_URL}/{endpoint}.xml", params=params, timeout=self.timeout)
+        r.raise_for_status()
+        # OpenDART binary endpoints return ZIP bytes with success/error encoded in headers/body.
+        return r.content
+
+    def corp_codes(self, refresh: bool = False) -> pd.DataFrame:
+        if self._corp_codes is not None and not refresh:
+            return self._corp_codes
+        params = {"crtfc_key": self.api_key}
+        r = self.session.get(f"{BASE_URL}/corpCode.xml", params=params, timeout=self.timeout)
+        r.raise_for_status()
+        raw = r.content
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                xml_name = zf.namelist()[0]
+                xml = zf.read(xml_name)
+        except zipfile.BadZipFile as e:
+            raise OpenDartError("corpCode.xml 응답이 ZIP이 아닙니다. API 키 또는 OpenDART 상태를 확인하세요.") from e
+        soup = BeautifulSoup(xml, "xml")
+        rows = []
+        for item in soup.find_all("list"):
+            rows.append({
+                "corp_code": item.find("corp_code").text.strip() if item.find("corp_code") else "",
+                "corp_name": item.find("corp_name").text.strip() if item.find("corp_name") else "",
+                "stock_code": item.find("stock_code").text.strip() if item.find("stock_code") else "",
+                "modify_date": item.find("modify_date").text.strip() if item.find("modify_date") else "",
+            })
+        self._corp_codes = pd.DataFrame(rows)
+        return self._corp_codes
+
+    def find_company(self, company_name: str) -> Company:
+        df = self.corp_codes()
+        exact = df[df["corp_name"].eq(company_name)]
+        if exact.empty:
+            exact = df[df["corp_name"].str.contains(re.escape(company_name), na=False)]
+        if exact.empty:
+            raise OpenDartError(f"기업을 찾지 못했습니다: {company_name}")
+        if len(exact) > 1:
+            # Prefer a listed entity with a stock code.
+            listed = exact[exact["stock_code"].ne("")]
+            if not listed.empty:
+                exact = listed
+        row = exact.iloc[0]
+        info = self.company(row["corp_code"])
+        return Company(
+            corp_code=row["corp_code"],
+            corp_name=info.get("corp_name") or row["corp_name"],
+            stock_code=info.get("stock_code") or row["stock_code"] or None,
+            corp_cls=info.get("corp_cls"),
+            ceo_nm=info.get("ceo_nm"),
+            jurir_no=info.get("jurir_no"),
+            homepage=info.get("hm_url"),
+            adres=info.get("adres"),
+        )
+
+    def company(self, corp_code: str) -> dict[str, Any]:
+        return self._get_json("company", {"corp_code": corp_code})
+
+    def disclosures(self, corp_code: str, start: str, end: str, page_count: int = 100) -> list[dict[str, Any]]:
+        data = self._get_json("list", {
+            "corp_code": corp_code,
+            "bgn_de": start,
+            "end_de": end,
+            "page_no": 1,
+            "page_count": min(page_count, 100),
+        })
+        return data.get("list", [])
+
+    def financials(self, corp_code: str, year: int, reprt_code: str = "11011") -> list[dict[str, Any]]:
+        data = self._get_json("fnlttSinglAcntAll", {
+            "corp_code": corp_code,
+            "bsns_year": str(year),
+            "reprt_code": reprt_code,
+            "fs_div": "CFS",
+        })
+        return data.get("list", [])
+
+    def financial_indicators(self, corp_code: str, year: int, reprt_code: str = "11011") -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for code in ("M210000", "M220000", "M230000", "M240000"):
+            try:
+                data = self._get_json("fnlttSinglIndx", {
+                    "corp_code": corp_code,
+                    "bsns_year": str(year),
+                    "reprt_code": reprt_code,
+                    "idx_cl_code": code,
+                })
+                out.extend(data.get("list", []))
+            except OpenDartError:
+                continue
+        return out
+
+    def stock_count(self, corp_code: str, year: int, reprt_code: str = "11011") -> list[dict[str, Any]]:
+        data = self._get_json("stockTotqySttus", {
+            "corp_code": corp_code,
+            "bsns_year": str(year),
+            "reprt_code": reprt_code,
+        })
+        return data.get("list", [])
+
+    # Compatibility wrappers used by the current Feature Engine app.
+    def resolve_company(self, query: str) -> Optional[dict[str, Any]]:
+        company = self.find_company(query)
+        return asdict(company)
+
+    def get_company_info(self, corp_code: str) -> dict[str, Any]:
+        return self.company(corp_code)
+
+    def get_financials(self, corp_code: str, year: int) -> pd.DataFrame:
+        rows = self.financials(corp_code, year)
+        if rows:
+            return pd.DataFrame(rows)
+        # Match the behavior of the original working app: fall back from CFS to OFS.
+        params = {
+            "corp_code": corp_code,
+            "bsns_year": str(year),
+            "reprt_code": REPORT_CODES["annual"],
+            "fs_div": "OFS",
+        }
+        data = self._get_json("fnlttSinglAcntAll", params)
         return pd.DataFrame(data.get("list", []))
 
     def search_filings(self, corp_code: str, bgn_de: date, end_de: date) -> pd.DataFrame:
-        corp_code = str(corp_code).zfill(8)
-        params = {
-            "crtfc_key": self.api_key,
-            "corp_code": corp_code,
-            "bgn_de": bgn_de.strftime("%Y%m%d"),
-            "end_de": end_de.strftime("%Y%m%d"),
-            "page_no": 1,
-            "page_count": 100,
-        }
-        data = _request_json(f"{DART_BASE}/list.json", params)
-        rows = data.get("list", [])
-        if not rows:
-            return pd.DataFrame(columns=["rcept_no", "report_nm", "rcept_dt", "flr_nm", "corp_name"])
-        return pd.DataFrame(rows)
+        rows = self.disclosures(corp_code, bgn_de.strftime("%Y%m%d"), end_de.strftime("%Y%m%d"))
+        if rows:
+            return pd.DataFrame(rows)
+        return pd.DataFrame(columns=["rcept_no", "report_nm", "rcept_dt", "flr_nm", "corp_name"])
 
+    def get_document_zip(self, rcept_no: str) -> tuple[Optional[str], bytes]:
+        r = self.session.get(f"{BASE_URL}/document.xml", params={"crtfc_key": self.api_key, "rcept_no": rcept_no}, timeout=self.timeout)
+        r.raise_for_status()
+        content = r.content
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(content))
+            return r.headers.get("Content-Type"), content
+        except zipfile.BadZipFile as e:
+            raise OpenDartError(f"공시원문을 ZIP으로 받지 못했습니다: {rcept_no}") from e
+
+
+
+ECOS_BASE = "https://ecos.bok.or.kr/api"
+
+OpenDARTClient = OpenDartClient
 
 class NaverFinanceClient:
     def __init__(self):
