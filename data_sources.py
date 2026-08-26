@@ -39,13 +39,22 @@ class OpenDARTClient:
         if exact.empty:
             return None
         row = exact.iloc[0].to_dict()
-        return {k: (None if pd.isna(v) else v) for k, v in row.items()}
+        row = {k: (None if pd.isna(v) else v) for k, v in row.items()}
+        # OpenDART requires corp_code as an 8-digit string and stock_code as a 6-digit string.
+        # XML parsing can coerce digit-only values to numbers and drop leading zeros.
+        if row.get("corp_code") is not None:
+            row["corp_code"] = str(row["corp_code"]).strip().zfill(8)
+        if row.get("stock_code") is not None:
+            row["stock_code"] = str(row["stock_code"]).strip().zfill(6)
+        return row
 
     def get_company_info(self, corp_code: str) -> dict:
+        corp_code = str(corp_code).strip().zfill(8)
         data = _request_json(f"{DART_BASE}/company.json", {"crtfc_key": self.api_key, "corp_code": corp_code})
         return {k: v for k, v in data.items() if k not in {"status", "message"}}
 
     def get_financials(self, corp_code: str, year: int) -> pd.DataFrame:
+        corp_code = str(corp_code).strip().zfill(8)
         # Consolidated annual statements first; fallback to separate statements.
         params = {
             "crtfc_key": self.api_key,
@@ -68,6 +77,7 @@ class OpenDARTClient:
         return pd.DataFrame(rows)
 
     def search_filings(self, corp_code: str, bgn_de: date, end_de: date) -> pd.DataFrame:
+        corp_code = str(corp_code).strip().zfill(8)
         params = {
             "crtfc_key": self.api_key,
             "corp_code": corp_code,
