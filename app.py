@@ -7,12 +7,12 @@ import streamlit as st
 
 from data_sources import OpenDARTClient, NaverFinanceClient, ECOSClient
 from feature_engine import build_feature_table
-from utils import load_settings
+from utils import load_settings, secret_status
 
 st.set_page_config(page_title="OpenDART Feature Engine", page_icon="📊", layout="wide")
 
 st.title("📊 기업 Feature Engine")
-st.caption("OpenDART + Naver Finance + 한국은행 ECOS를 이용해 Value / Quality / Momentum / Growth / Risk 지표를 계산합니다. GPT는 사용하지 않습니다.")
+st.caption("OpenDART + Naver Finance + 한국은행 ECOS로 Value / Quality / Momentum / Growth / Risk Feature를 계산합니다. GPT는 아직 분석에 사용하지 않지만 API Key는 미리 고정 저장할 수 있습니다.")
 
 settings = load_settings()
 
@@ -20,10 +20,16 @@ with st.sidebar:
     st.header("데이터 설정")
     dart_key = st.text_input("OpenDART API Key", value=settings.get("OPENDART_API_KEY", ""), type="password")
     ecos_key = st.text_input("ECOS API Key", value=settings.get("ECOS_API_KEY", ""), type="password")
-    st.info("Streamlit Cloud에서는 Settings → Secrets에 키를 넣으면 매번 입력하지 않아도 됩니다.")
+    status = secret_status(settings)
+    st.divider()
+    st.write("**Secrets 상태**")
+    st.write(f"OpenDART: {'감지됨' if status['OPENDART_API_KEY'] else '없음'}")
+    st.write(f"ECOS: {'감지됨' if status['ECOS_API_KEY'] else '없음'}")
+    st.write(f"OpenAI/GPT: {'감지됨' if status['OPENAI_API_KEY'] else '없음'}")
+    st.caption("키 값은 화면에 표시하지 않습니다. Streamlit Cloud Secrets는 TOML 형식의 root-level 또는 [api_keys]/[default] 섹션도 읽습니다.")
     st.divider()
     st.write("현재 버전")
-    st.write("• GPT/LLM: 사용 안 함\n• Quant scoring: 사용 안 함\n• Feature 계산까지만")
+    st.write("• GPT/LLM: 아직 사용 안 함\n• OpenAI Key: 미리 저장 가능\n• Quant scoring: 사용 안 함\n• Feature 계산까지만")
 
 company = st.text_input("분석할 기업명", placeholder="예: 삼성전자")
 year = st.number_input("재무 기준연도", min_value=2015, max_value=date.today().year, value=max(2015, date.today().year - 1), step=1)
