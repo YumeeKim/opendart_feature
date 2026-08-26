@@ -7,7 +7,62 @@ import streamlit as st
 
 from data_sources import OpenDARTClient, NaverFinanceClient, ECOSClient
 from feature_engine import build_feature_table
-from utils import load_settings, secret_status
+
+
+SECRET_ALIASES = {
+    "OPENDART_API_KEY": ["OPENDART_API_KEY", "DART_API_KEY", "OPEN_DART_API_KEY"],
+    "ECOS_API_KEY": ["ECOS_API_KEY", "BOK_ECOS_API_KEY"],
+    "OPENAI_API_KEY": ["OPENAI_API_KEY", "OPENAI_KEY", "GPT_API_KEY"],
+}
+SECTION_NAMES = ("default", "api_keys", "secrets", "keys")
+
+def _text(value):
+    return "" if value is None else str(value).strip()
+
+def load_settings():
+    values = {}
+    try:
+        secrets = st.secrets
+    except Exception:
+        secrets = {}
+    for canonical, aliases in SECRET_ALIASES.items():
+        value = None
+        for name in aliases:
+            try:
+                if name in secrets and _text(secrets[name]):
+                    value = _text(secrets[name])
+                    break
+            except Exception:
+                pass
+        if not value:
+            for section_name in SECTION_NAMES:
+                try:
+                    if section_name not in secrets:
+                        continue
+                    section = secrets[section_name]
+                    for name in aliases:
+                        if name in section and _text(section[name]):
+                            value = _text(section[name])
+                            break
+                    if value:
+                        break
+                except Exception:
+                    pass
+        if not value:
+            for name in aliases:
+                value = _text(os.getenv(name))
+                if value:
+                    break
+        if value:
+            values[canonical] = value
+    return values
+
+def secret_status(settings):
+    return {
+        "OPENDART_API_KEY": bool(settings.get("OPENDART_API_KEY")),
+        "ECOS_API_KEY": bool(settings.get("ECOS_API_KEY")),
+        "OPENAI_API_KEY": bool(settings.get("OPENAI_API_KEY")),
+    }
 
 st.set_page_config(page_title="OpenDART Feature Engine", page_icon="📊", layout="wide")
 
