@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import io
 import zipfile
+import xml.etree.ElementTree as ET
 from datetime import date, datetime
 from typing import Any, Dict, Optional
-import xml.etree.ElementTree as ET
 
 import pandas as pd
 import requests
@@ -26,16 +26,11 @@ def _request_json(url: str, params: dict, timeout: int = 30) -> dict:
 
 @st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
 def _load_corp_codes(api_key: str) -> pd.DataFrame:
-    raw = requests.get(
-        f"{DART_BASE}/corpCode.xml",
-        params={"crtfc_key": api_key},
-        timeout=30,
-    )
+    raw = requests.get(f"{DART_BASE}/corpCode.xml", params={"crtfc_key": api_key}, timeout=30)
     raw.raise_for_status()
     zf = zipfile.ZipFile(io.BytesIO(raw.content))
     xml_name = next(name for name in zf.namelist() if name.lower().endswith(".xml"))
-    xml = zf.read(xml_name)
-    df = pd.read_xml(io.BytesIO(xml), xpath="/result/list")
+    df = pd.read_xml(io.BytesIO(zf.read(xml_name)), xpath="/result/list")
     if df is None or df.empty:
         raise RuntimeError("OpenDART corpCode.xml에서 기업 목록을 읽지 못했습니다.")
     for col, width in (("corp_code", 8), ("stock_code", 6)):
@@ -46,7 +41,7 @@ def _load_corp_codes(api_key: str) -> pd.DataFrame:
 
 class OpenDARTClient:
     def __init__(self, api_key: str):
-        self.api_key = api_key
+        self.api_key = api_key.strip()
 
     def resolve_company(self, query: str) -> Optional[dict]:
         df = _load_corp_codes(self.api_key)
@@ -64,10 +59,7 @@ class OpenDARTClient:
 
     def get_company_info(self, corp_code: str) -> dict:
         corp_code = str(corp_code).zfill(8)
-        data = _request_json(
-            f"{DART_BASE}/company.json",
-            {"crtfc_key": self.api_key, "corp_code": corp_code},
-        )
+        data = _request_json(f"{DART_BASE}/company.json", {"crtfc_key": self.api_key, "corp_code": corp_code})
         return {k: v for k, v in data.items() if k not in {"status", "message"}}
 
     def get_financials(self, corp_code: str, year: int) -> pd.DataFrame:
@@ -87,8 +79,7 @@ class OpenDARTClient:
             r = requests.get(f"{DART_BASE}/fnlttSinglAcntAll.json", params=params, timeout=30)
             r.raise_for_status()
             data = r.json()
-        rows = data.get("list", [])
-        return pd.DataFrame(rows)
+        return pd.DataFrame(data.get("list", []))
 
     def search_filings(self, corp_code: str, bgn_de: date, end_de: date) -> pd.DataFrame:
         corp_code = str(corp_code).zfill(8)
@@ -108,73 +99,46 @@ class OpenDARTClient:
 
 
 class NaverFinanceClient:
-    """Naver Finance market-data reader.
-
-    Uses Naver's chart XML endpoint first because it is lighter and more stable
-    than scraping the HTML table. HTML scraping is only a fallback for current price.
-    """
-
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/126.0 Safari/537.36"
-                ),
-                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Referer": "https://finance.naver.com/",
-            }
-        )
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://finance.naver.com/",
+        })
 
     def _get_fchart_history(self, code: str, count: int = 1250) -> pd.DataFrame:
-        url = "https://fchart.stock.naver.com/sise.nhn"
-        params = {
-            "symbol": code,
-            "timeframe": "day",
-            "count": count,
-            "requestType": "0",
-        }
-        r = self.session.get(url, params=params, timeout=30)
+        r = self.session.get(
+            "https://fchart.stock.naver.com/sise.nhn",
+            params={"symbol": code, "timeframe": "day", "count": count, "requestType": "0"},
+            timeout=30,
+        )
         r.raise_for_status()
         r.encoding = "euc-kr"
         root = ET.fromstring(r.text)
         rows = []
         for item in root.findall(".//item"):
-            raw = item.attrib.get("data", "")
-            parts = raw.split("|")
-            if len(parts) != 6:
-                continue
-            rows.append(parts)
+            parts = item.attrib.get("data", "").split("|")
+            if len(parts) == 6:
+                rows.append(parts)
         if not rows:
             raise RuntimeError("Naver chart endpoint returned no price rows.")
         df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume"])
         df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="coerce")
         for c in ["open", "high", "low", "close", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
-        return df
+        return df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
 
     def _get_current_from_html(self, code: str) -> Optional[float]:
-        url = f"https://finance.naver.com/item/main.naver?code={code}"
-        r = self.session.get(url, timeout=30)
+        r = self.session.get(f"https://finance.naver.com/item/main.naver?code={code}", timeout=30)
         r.raise_for_status()
         r.encoding = r.apparent_encoding or "euc-kr"
         soup = BeautifulSoup(r.text, "html.parser")
-        # Common current-price nodes used by the Naver desktop page.
-        selectors = [
-            "p.no_today span.blind",
-            "div.today p.no_today span.blind",
-            "div.rate_info p.no_today span.blind",
-            "#chart_area .blind",
-        ]
-        for css in selectors:
+        for css in ["p.no_today span.blind", "div.today p.no_today span.blind"]:
             node = soup.select_one(css)
             if node:
-                raw = node.get_text(strip=True).replace(",", "")
                 try:
-                    return float(raw)
+                    return float(node.get_text(strip=True).replace(",", ""))
                 except ValueError:
                     pass
         return None
@@ -183,22 +147,15 @@ class NaverFinanceClient:
         if not stock_code:
             raise RuntimeError("DART에서 종목코드를 찾지 못했습니다.")
         code = str(stock_code).zfill(6)
-        history = self._get_fchart_history(code, count=1250)
+        history = self._get_fchart_history(code)
         current_price = float(history.iloc[-1]["close"])
-        html_current = None
         try:
-            html_current = self._get_current_from_html(code)
+            current = self._get_current_from_html(code)
+            if current is not None:
+                current_price = current
         except Exception:
             pass
-        if html_current is not None:
-            current_price = html_current
-        return {
-            "stock_code": code,
-            "current_price": current_price,
-            "history": history,
-            "market_status": "OK",
-            "snapshot_raw": {"current": current_price, "history_rows": len(history)},
-        }
+        return {"stock_code": code, "current_price": current_price, "history": history, "market_status": "OK"}
 
 
 class ECOSClient:
@@ -210,14 +167,20 @@ class ECOSClient:
     def _statistic(
         self,
         stat_code: str,
-        item_code1: Optional[str],
         cycle: str,
         start: str,
         end: str,
-        timeout: int = 20,
+        item_code1: Optional[str] = None,
+        item_code2: Optional[str] = None,
+        timeout: int = 30,
     ) -> pd.DataFrame:
-        base = f"{ECOS_BASE}/StatisticSearch/{self.api_key}/json/kr/1/10000/{stat_code}/{cycle}/{start}/{end}"
-        url = f"{base}/{item_code1}" if item_code1 else base
+        # ECOS StatisticSearch path: .../{stat}/{cycle}/{start}/{end}/{item1}/{item2}/...
+        parts = [ECOS_BASE, "StatisticSearch", self.api_key, "json", "kr", "1", "10000", stat_code, cycle, start, end]
+        if item_code1:
+            parts.append(item_code1)
+        if item_code2:
+            parts.append(item_code2)
+        url = "/".join(parts)
         r = requests.get(url, timeout=timeout)
         r.raise_for_status()
         data = r.json()
@@ -234,46 +197,51 @@ class ECOSClient:
             df["DATA_VALUE"] = pd.to_numeric(df["DATA_VALUE"], errors="coerce")
         return df
 
+    @staticmethod
+    def _monthly_period(offset_months: int = 0) -> str:
+        now = pd.Timestamp.today().to_period("M") - offset_months
+        return now.strftime("%Y%m")
+
     def get_macro_snapshot(self) -> dict:
-        # Base rate: BoK 722Y001, item 0101000. Monthly series is enough for
-        # Feature Engine and is much lighter than downloading the daily history.
-        today = datetime.now()
-        end = today.strftime("%Y%m")
-        result: Dict[str, Any] = {"status": "OK", "series": {}}
-        errors = []
+        end_m = self._monthly_period(0)
+        start_m = self._monthly_period(72)
+        end_d = pd.Timestamp.today().strftime("%Y%m%d")
+        start_d = (pd.Timestamp.today() - pd.Timedelta(days=365 * 6)).strftime("%Y%m%d")
+        result: Dict[str, Any] = {"status": "OK", "series": {}, "errors": []}
 
-        try:
-            base_df = self._statistic(
-                stat_code="722Y001",
-                item_code1="0101000",
-                cycle="M",
-                start="202001",
-                end=end,
-            )
-            if not base_df.empty:
-                result["series"]["base_rate"] = base_df.tail(36).to_dict(orient="records")
-        except Exception as exc:
-            errors.append(f"base_rate: {exc}")
-            result["series"]["base_rate"] = []
+        specs = {
+            "base_rate": ("722Y001", "M", start_m, end_m, "0101000", None, "기준금리", "%"),
+            "ktb_3y": ("817Y002", "D", start_d, end_d, "010200000", None, "국고채 3년", "%"),
+            "ktb_10y": ("817Y002", "D", start_d, end_d, "010210000", None, "국고채 10년", "%"),
+            "usdkrw": ("731Y004", "M", start_m, end_m, "0000001", "0000100", "원/달러", "KRW/USD"),
+            "cpi": ("901Y009", "M", start_m, end_m, "0", None, "소비자물가지수", "index"),
+            "gdp_real": ("200Y102", "Q", "2020Q1", "2026Q4", "10111", None, "실질 GDP", "level"),
+        }
 
-        # Market interest-rate table. We first query the table and keep the
-        # latest rows; exact item mapping can be expanded after this base layer
-        # is validated in the app.
-        try:
-            rate_df = self._statistic(
-                stat_code="817Y002",
-                item_code1=None,
-                cycle="M",
-                start="202001",
-                end=end,
-            )
-            if not rate_df.empty:
-                result["series"]["market_rates"] = rate_df.tail(120).to_dict(orient="records")
-        except Exception as exc:
-            errors.append(f"market_rates: {exc}")
-            result["series"]["market_rates"] = []
+        for key, (stat, cycle, start, end, item1, item2, label, unit) in specs.items():
+            try:
+                df = self._statistic(stat, cycle, start, end, item1, item2)
+                if not df.empty:
+                    result["series"][key] = {
+                        "label": label,
+                        "unit": unit,
+                        "stat_code": stat,
+                        "item_code1": item1,
+                        "item_code2": item2,
+                        "data": df.to_dict(orient="records"),
+                    }
+                else:
+                    result["series"][key] = {"label": label, "unit": unit, "data": []}
+                    result["errors"].append(f"{key}: no data")
+            except Exception as exc:
+                result["series"][key] = {"label": label, "unit": unit, "data": []}
+                result["errors"].append(f"{key}: {exc}")
 
-        if errors:
-            result["status"] = "PARTIAL" if any(result["series"].values()) else "ERROR"
-            result["errors"] = errors
+        ok_count = sum(bool(v.get("data")) for v in result["series"].values())
+        if ok_count == len(specs):
+            result["status"] = "OK"
+        elif ok_count > 0:
+            result["status"] = "PARTIAL"
+        else:
+            result["status"] = "ERROR"
         return result
