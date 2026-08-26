@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import zipfile
 import xml.etree.ElementTree as ET
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import date, datetime
 from typing import Any, Dict, Optional
 
@@ -24,19 +26,40 @@ def _request_json(url: str, params: dict, timeout: int = 30) -> dict:
     return data
 
 
-@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
 def _load_corp_codes(api_key: str) -> pd.DataFrame:
-    raw = requests.get(f"{DART_BASE}/corpCode.xml", params={"crtfc_key": api_key}, timeout=30)
-    raw.raise_for_status()
-    zf = zipfile.ZipFile(io.BytesIO(raw.content))
-    xml_name = next(name for name in zf.namelist() if name.lower().endswith(".xml"))
-    df = pd.read_xml(io.BytesIO(zf.read(xml_name)), xpath="/result/list")
-    if df is None or df.empty:
-        raise RuntimeError("OpenDART corpCode.xml에서 기업 목록을 읽지 못했습니다.")
-    for col, width in (("corp_code", 8), ("stock_code", 6)):
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(width)
-    return df
+    # OpenDART's English API provides a JSON corporation-code endpoint.
+    # It avoids downloading/parsing the large ZIP/XML payload used by corpCode.xml.
+    url = "https://engopendart.fss.or.kr/engapi/corpCode.json"
+    session = requests.Session()
+    retry = Retry(total=3, connect=3, read=3, backoff_factor=0.6,
+                  status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=["GET"], raise_on_status=False)
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; OpenDART Feature Engine/1.0)",
+        "Accept": "application/json,text/plain,*/*",
+    })
+
+    last_error = None
+    for timeout in (10, 20, 40):
+        try:
+            raw = session.get(url, params={"crtfc_key": api_key}, timeout=(5, timeout))
+            raw.raise_for_status()
+            data = raw.json()
+            if str(data.get("status", "000")) != "000":
+                raise RuntimeError(f"OpenDART corporation-code API error {data.get('status')}: {data.get('message')}")
+            rows = data.get("list", [])
+            df = pd.DataFrame(rows)
+            if df.empty:
+                raise RuntimeError("OpenDART corporation-code API returned no companies.")
+            for col, width in (("corp_code", 8), ("stock_code", 6)):
+                if col in df.columns:
+                    df[col] = df[col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(width)
+            return df
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"OpenDART corporation-code lookup failed after retries: {last_error}")
 
 
 class OpenDARTClient:
