@@ -127,20 +127,42 @@ def build_feature_table(company_info: dict, financials: pd.DataFrame, market: di
     add("Momentum", "Annualized Volatility", vol, "%", source="Naver Finance")
     add("Momentum", "Max Drawdown", dd, "%", source="Naver Finance")
 
+    avg_volume_20d = None
+    latest_volume = None
+    if hist is not None and not hist.empty:
+        if "volume" in hist.columns:
+            v = pd.to_numeric(hist["volume"], errors="coerce").dropna()
+            if not v.empty:
+                latest_volume = float(v.iloc[-1])
+                if len(v) >= 20:
+                    avg_volume_20d = float(v.tail(20).mean())
+    add("Momentum", "Latest Volume", latest_volume, "shares", source="Naver Finance")
+    add("Momentum", "20D Average Volume", avg_volume_20d, "shares", source="Naver Finance")
+
     add("Risk / Accounting", "Receivable Growth vs Sales Growth", None, "pp", "PENDING", "Requires multi-year statement panel mapping")
     add("Risk / Accounting", "Inventory Growth vs Sales Growth", None, "pp", "PENDING", "Requires multi-year statement panel mapping")
     add("Risk / Accounting", "CFO - Net Income", (cfo - net_income) if cfo is not None and net_income is not None else None, "KRW million")
     add("Risk / Accounting", "Debt", debt, "KRW million")
     add("Risk / Accounting", "Recent High-Risk Filings", int(_count_high_risk_notices(notices)), "count", source="OpenDART")
 
+    # ECOS data is normalized by ECOSClient into macro["series"].
     macro_rate = None
-    if macro and macro.get("base_rate_like_series"):
+    macro_rate_date = None
+    market_rate_rows = []
+    if macro:
         try:
-            last = macro["base_rate_like_series"][-1]
-            macro_rate = last.get("DATA_VALUE")
+            series = macro.get("series", {})
+            base_rows = series.get("base_rate", [])
+            if base_rows:
+                last = base_rows[-1]
+                macro_rate = last.get("DATA_VALUE")
+                macro_rate_date = last.get("TIME")
+            market_rate_rows = series.get("market_rates", [])
         except Exception:
             pass
-    add("Macro", "Policy/Rate Series", macro_rate, "", source="ECOS")
+    add("Macro", "Policy Rate", macro_rate, "%", source="ECOS")
+    add("Macro", "Policy Rate Observation", macro_rate_date, "", source="ECOS")
+    add("Macro", "Market Rate Series Rows", len(market_rate_rows), "rows", source="ECOS")
     add("Industry", "Industry / Sector", company_info.get("induty_code") or company_info.get("industry_code"), "", source="OpenDART/company info")
     add("Company", "Fiscal Year", company_info.get("acc_mt"), "", source="OpenDART")
     add("Company", "Employees", company_info.get("emp_stdn_nb"), "people", source="OpenDART")
