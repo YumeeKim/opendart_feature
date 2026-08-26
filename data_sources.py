@@ -243,19 +243,110 @@ class NaverFinanceClient:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         return df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
 
-    def _get_current_from_html(self, code: str) -> Optional[float]:
-        r = self.session.get(f"https://finance.naver.com/item/main.naver?code={code}", timeout=30)
-        r.raise_for_status()
-        r.encoding = r.apparent_encoding or "euc-kr"
-        soup = BeautifulSoup(r.text, "html.parser")
-        for css in ["p.no_today span.blind", "div.today p.no_today span.blind"]:
+    @staticmethod
+    def _to_number(text: str) -> Optional[float]:
+        if text is None:
+            return None
+        cleaned = str(text).replace(",", "").replace("\xa0", " ").strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        m = re.search(r"[-+]?\d+(?:\.\d+)?", cleaned)
+        return float(m.group(0)) if m else None
+
+    @staticmethod
+    def _extract_metric_from_cell(cell_text: str, metric: str) -> Optional[float]:
+        """Extract PER/PBR from Naver cells that may contain merged labels and periods.
+
+        Examples handled:
+        - 'PER 12.34배'
+        - 'PER l EPS(2024.12) 12.34 l 7,123원'
+        - 'PBR l BPS(2024.12) 1.23 l 80,000원'
+        """
+        text = str(cell_text or "").replace("\xa0", " ")
+        text = re.sub(r"\s+", " ", text).strip()
+        # Prefer the number immediately followed by the Korean multiple/unit marker.
+        m = re.search(rf"{re.escape(metric)}.*?([-+]?\d+(?:\.\d+)?)\s*(?:배|[xX])\b", text, flags=re.I)
+        if m:
+            return float(m.group(1).replace(",", ""))
+
+        # If the label is merged with EPS/BPS and the unit marker is absent,
+        # ignore year-like tokens (e.g. 2024.12) and currency-like large integers,
+        # then prefer a decimal value after the metric label.
+        tail = text[text.upper().find(metric.upper()) + len(metric):] if metric.upper() in text.upper() else text
+        candidates = re.findall(r"[-+]?\d+(?:\.\d+)?", tail.replace(",", ""))
+        for raw in candidates:
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if value >= 1900 and value <= 2100:
+                continue
+            if "." in raw and abs(value) < 1000:
+                return value
+        for raw in candidates:
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if 0 < abs(value) < 1000:
+                return value
+        return None
+
+    def _get_current_from_html(self, soup: BeautifulSoup) -> Optional[float]:
+        for css in ["#_nowVal", "p.no_today span.blind", "div.today p.no_today span.blind"]:
             node = soup.select_one(css)
             if node:
-                try:
-                    return float(node.get_text(strip=True).replace(",", ""))
-                except ValueError:
-                    pass
+                value = self._to_number(node.get_text(" ", strip=True))
+                if value is not None:
+                    return value
         return None
+
+    def _get_navervaluation_from_html(self, code: str) -> dict:
+        r = self.session.get(f"https://finance.naver.com/item/main.naver?code={code}", timeout=30)
+        r.raise_for_status()
+        # Prefer server/apparent encoding; fall back to EUC-KR for legacy pages.
+        enc = r.apparent_encoding or r.encoding or "euc-kr"
+        try:
+            text = r.content.decode(enc, errors="replace")
+        except Exception:
+            text = r.content.decode("euc-kr", errors="replace")
+        soup = BeautifulSoup(text, "html.parser")
+
+        result = {"per": None, "pbr": None, "market_cap": None, "listed_shares": None, "valuation_source": None}
+
+        # 1) Stable Naver IDs first.
+        for metric in ("per", "pbr"):
+            node = soup.select_one(f"#{'_per' if metric == 'per' else '_pbr'}")
+            if node:
+                value = self._to_number(node.get_text(" ", strip=True))
+                if value is not None:
+                    result[metric] = value
+
+        # 2) Fallback: inspect cells containing PER/PBR labels. Naver may merge
+        # labels with EPS/BPS and the reference period in the same cell.
+        if result["per"] is None or result["pbr"] is None:
+            for cell in soup.find_all(["td", "th", "em", "span"]):
+                cell_text = cell.get_text(" ", strip=True)
+                upper = cell_text.upper()
+                if result["per"] is None and "PER" in upper:
+                    value = self._extract_metric_from_cell(cell_text, "PER")
+                    if value is not None:
+                        result["per"] = value
+                if result["pbr"] is None and "PBR" in upper:
+                    value = self._extract_metric_from_cell(cell_text, "PBR")
+                    if value is not None:
+                        result["pbr"] = value
+                if result["per"] is not None and result["pbr"] is not None:
+                    break
+
+        # 3) Supporting market-cap/share count values, useful for later FCF-yield and
+        # valuation work. Naver commonly exposes these through stable IDs.
+        for css, key in [("#_market_sum", "market_cap"), ("#_listed_stock_cnt", "listed_shares")]:
+            node = soup.select_one(css)
+            if node:
+                result[key] = node.get_text(" ", strip=True)
+
+        result["valuation_source"] = "Naver Finance HTML"
+        return result
 
     def get_snapshot_and_history(self, stock_code: Optional[str]) -> dict:
         if not stock_code:
@@ -263,13 +354,33 @@ class NaverFinanceClient:
         code = str(stock_code).zfill(6)
         history = self._get_fchart_history(code)
         current_price = float(history.iloc[-1]["close"])
+        valuation = {"per": None, "pbr": None, "market_cap": None, "listed_shares": None, "valuation_source": None}
         try:
-            current = self._get_current_from_html(code)
-            if current is not None:
-                current_price = current
+            valuation = self._get_navervaluation_from_html(code)
         except Exception:
-            pass
-        return {"stock_code": code, "current_price": current_price, "history": history, "market_status": "OK"}
+            # Keep the price-history path working even when the Naver HTML page is unavailable.
+            try:
+                r = self.session.get(f"https://finance.naver.com/item/main.naver?code={code}", timeout=30)
+                r.raise_for_status()
+                enc = r.apparent_encoding or r.encoding or "euc-kr"
+                text = r.content.decode(enc, errors="replace")
+                soup = BeautifulSoup(text, "html.parser")
+                html_current = self._get_current_from_html(soup)
+                if html_current is not None:
+                    current_price = html_current
+            except Exception:
+                pass
+        return {
+            "stock_code": code,
+            "current_price": current_price,
+            "history": history,
+            "per": valuation.get("per"),
+            "pbr": valuation.get("pbr"),
+            "market_cap": valuation.get("market_cap"),
+            "listed_shares": valuation.get("listed_shares"),
+            "valuation_source": valuation.get("valuation_source"),
+            "market_status": "OK",
+        }
 
 
 class ECOSClient:
