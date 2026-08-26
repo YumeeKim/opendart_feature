@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+from typing import Any, Dict
+
 import numpy as np
 import pandas as pd
 
@@ -20,7 +22,8 @@ def _pick_account(df: pd.DataFrame, candidates):
     name_cols = [c for c in ["account_nm", "account_detail", "account_id"] if c in df.columns]
     for cand in candidates:
         for col in name_cols:
-            sub = df[df[col].astype(str).str.contains(cand, case=False, na=False)]
+            mask = df[col].astype(str).str.contains(cand, case=False, na=False)
+            sub = df[mask]
             if not sub.empty:
                 for value_col in ["thstrm_amount", "thstrm_add_amount", "frmtrm_amount", "frmtrm_q_amount"]:
                     if value_col in sub.columns:
@@ -28,50 +31,19 @@ def _pick_account(df: pd.DataFrame, candidates):
     return None
 
 
-def _return_months(history, months):
+def _annual_return(history: pd.DataFrame, months: int):
     if history is None or history.empty or "close" not in history.columns:
         return None
     h = history.dropna(subset=["date", "close"]).copy()
+    if h.empty:
+        return None
     last = h.iloc[-1]
     target = last["date"] - pd.DateOffset(months=months)
     old = h.iloc[(h["date"] - target).abs().argmin()]
     return (float(last["close"]) / float(old["close"]) - 1) * 100
 
 
-def _series_last(macro, key):
-    s = (macro or {}).get("series", {}).get(key, {})
-    rows = s.get("data", [])
-    if not rows:
-        return None, None
-    row = rows[-1]
-    return _num(row.get("DATA_VALUE")), row.get("TIME")
-
-
-def _series_df(macro, key):
-    s = (macro or {}).get("series", {}).get(key, {})
-    rows = s.get("data", [])
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
-
-
-def _yoy(df):
-    if df.empty or "DATA_VALUE" not in df.columns or "TIME" not in df.columns:
-        return None
-    d = df[["TIME", "DATA_VALUE"]].copy()
-    d["DATA_VALUE"] = pd.to_numeric(d["DATA_VALUE"], errors="coerce")
-    d = d.dropna().sort_values("TIME")
-    if len(d) < 5:
-        return None
-    try:
-        latest = float(d.iloc[-1]["DATA_VALUE"])
-        prev = float(d.iloc[-5]["DATA_VALUE"])
-        return (latest / prev - 1) * 100 if prev else None
-    except Exception:
-        return None
-
-
-def build_feature_table(company_info, financials, market, macro, notices, asof):
+def build_feature_table(company_info: dict, financials: pd.DataFrame, market: dict | None, macro: dict | None, notices: pd.DataFrame, asof: pd.Timestamp) -> pd.DataFrame:
     rows = []
     f = financials.copy() if financials is not None else pd.DataFrame()
 
@@ -84,109 +56,132 @@ def build_feature_table(company_info, financials, market, macro, notices, asof):
     current_liab = _pick_account(f, ["유동부채", "CurrentLiabilities"])
     cash = _pick_account(f, ["현금및현금성자산", "현금및현금성 자산", "CashAndCashEquivalents"])
     debt = _pick_account(f, ["차입금", "단기차입금", "장기차입금", "Borrowings"])
+    receivable = _pick_account(f, ["매출채권", "AccountsReceivable"])
+    inventory = _pick_account(f, ["재고자산", "Inventories"])
     cfo = _pick_account(f, ["영업활동현금흐름", "영업활동으로 인한 현금흐름", "NetCashProvidedByUsedInOperatingActivities"])
     capex = _pick_account(f, ["유형자산의 취득", "유형자산취득", "PurchaseOfPropertyPlantAndEquipment"])
     interest = _pick_account(f, ["이자비용", "금융원가", "InterestExpense"])
     tax = _pick_account(f, ["법인세비용", "법인세비용(수익)", "IncomeTaxExpense"])
 
     current_price = (market or {}).get("current_price")
+    per = (market or {}).get("per")
+    pbr = (market or {}).get("pbr")
+    market_cap = (market or {}).get("market_cap")
+    listed_shares = (market or {}).get("listed_shares")
     hist = (market or {}).get("history")
 
-    vol = dd = None
+    # Market features
+    ret_1m = _annual_return(hist, 1)
+    ret_3m = _annual_return(hist, 3)
+    ret_6m = _annual_return(hist, 6)
+    ret_12m = _annual_return(hist, 12)
+
+    vol = None
+    dd = None
     if hist is not None and not hist.empty and "close" in hist.columns:
         h = hist.dropna(subset=["close"]).copy()
         daily = h["close"].pct_change().dropna()
         if len(daily) >= 20:
             vol = daily.std() * np.sqrt(252) * 100
         peak = h["close"].cummax()
-        dd = ((h["close"] / peak) - 1).min() * 100
+        dd = ((h["close"] / peak) - 1).min() * 100 if not h.empty else None
 
-    tax_rate = max(0.0, min(0.35, tax / op_income)) if op_income not in (None, 0) and tax is not None else None
+    # Basic ratios. These are deliberately transparent first-version formulas.
+    tax_rate = None
+    if op_income and tax is not None and op_income != 0:
+        tax_rate = max(0.0, min(0.35, tax / op_income))
     nopat = op_income * (1 - tax_rate) if op_income is not None and tax_rate is not None else None
-    invested_capital = equity + (debt or 0) - (cash or 0) if equity is not None else None
-    roic = nopat / invested_capital * 100 if nopat is not None and invested_capital not in (None, 0) else None
-    roe = net_income / equity * 100 if net_income is not None and equity not in (None, 0) else None
-    roa = net_income / assets * 100 if net_income is not None and assets not in (None, 0) else None
-    op_margin = op_income / revenue * 100 if op_income is not None and revenue not in (None, 0) else None
-    current_ratio = current_assets / current_liab if current_assets is not None and current_liab not in (None, 0) else None
-    debt_equity = debt / equity * 100 if debt is not None and equity not in (None, 0) else None
-    interest_cov = op_income / interest if op_income is not None and interest not in (None, 0) else None
-    fcf = cfo + capex if cfo is not None and capex is not None else None
-    cfo_ni = cfo / net_income if cfo is not None and net_income not in (None, 0) else None
+    invested_capital = None
+    if equity is not None:
+        invested_capital = equity + (debt or 0) - (cash or 0)
+    roic = (nopat / invested_capital * 100) if nopat is not None and invested_capital not in (None, 0) else None
+    roe = (net_income / equity * 100) if net_income is not None and equity not in (None, 0) else None
+    roa = (net_income / assets * 100) if net_income is not None and assets not in (None, 0) else None
+    op_margin = (op_income / revenue * 100) if op_income is not None and revenue not in (None, 0) else None
+    current_ratio = (current_assets / current_liab) if current_assets is not None and current_liab not in (None, 0) else None
+    debt_equity = (debt / equity * 100) if debt is not None and equity not in (None, 0) else None
+    interest_cov = (op_income / interest) if op_income is not None and interest not in (None, 0) else None
+    fcf = (cfo + capex) if cfo is not None and capex is not None else None
+    fcf_yield = None
+    # Naver market cap text is display-formatted (e.g. '340조 8,746'), so keep
+    # FCF Yield disabled until a dedicated parser is added. PER/PBR are sourced
+    # directly from Naver and do not require recomputation here.
+    cfo_ni = (cfo / net_income) if cfo is not None and net_income not in (None, 0) else None
 
     def add(cat, feature, value, unit="", flag="OK", source="OpenDART"):
         rows.append({"category": cat, "feature": feature, "value": value, "unit": unit, "quality_flag": flag, "source": source})
 
     add("Value", "Current Price", current_price, "KRW", source="Naver Finance")
-    add("Value", "PER", None, "x", "PENDING", "Market cap/EPS mapping")
-    add("Value", "PBR", None, "x", "PENDING", "Market cap/book mapping")
-    add("Value", "EV/EBITDA", None, "x", "PENDING", "EV/EBITDA mapping")
-    add("Value", "FCF Yield", None, "%", "PENDING", "Needs market cap")
+    add("Value", "PER", per, "x", "OK" if per is not None else "N/A", source="Naver Finance")
+    add("Value", "PBR", pbr, "x", "OK" if pbr is not None else "N/A", source="Naver Finance")
+    add("Value", "Market Cap", market_cap, "display", "INFO" if market_cap else "N/A", source="Naver Finance")
+    add("Value", "Listed Shares", listed_shares, "shares", "INFO" if listed_shares else "N/A", source="Naver Finance")
+    add("Value", "EV/EBITDA", None, "x", "PENDING", "EBITDA mapping will be added next")
+    add("Value", "FCF Yield", fcf_yield, "%", source="OpenDART + Naver Finance")
 
-    for name, value, unit in [
-        ("ROIC", roic, "%"), ("ROE", roe, "%"), ("ROA", roa, "%"),
-        ("Operating Margin", op_margin, "%"), ("Current Ratio", current_ratio, "x"),
-        ("Debt / Equity", debt_equity, "%"), ("Interest Coverage", interest_cov, "x"),
-        ("CFO / Net Income", cfo_ni, "x"), ("FCF", fcf, "KRW million"),
-    ]:
-        add("Quality", name, value, unit)
+    add("Quality", "ROIC", roic, "%")
+    add("Quality", "ROE", roe, "%")
+    add("Quality", "ROA", roa, "%")
+    add("Quality", "Operating Margin", op_margin, "%")
+    add("Quality", "Current Ratio", current_ratio, "x")
+    add("Quality", "Debt / Equity", debt_equity, "%")
+    add("Quality", "Interest Coverage", interest_cov, "x")
+    add("Quality", "CFO / Net Income", cfo_ni, "x")
+    add("Quality", "FCF", fcf, "KRW million")
 
-    for months, label in [(1, "1M Return"), (3, "3M Return"), (6, "6M Return"), (12, "12M Return")]:
-        add("Momentum", label, _return_months(hist, months), "%", source="Naver Finance")
+    add("Momentum", "1M Return", ret_1m, "%", source="Naver Finance")
+    add("Momentum", "3M Return", ret_3m, "%", source="Naver Finance")
+    add("Momentum", "6M Return", ret_6m, "%", source="Naver Finance")
+    add("Momentum", "12M Return", ret_12m, "%", source="Naver Finance")
     add("Momentum", "Annualized Volatility", vol, "%", source="Naver Finance")
     add("Momentum", "Max Drawdown", dd, "%", source="Naver Finance")
 
-    latest_volume = avg_volume_20d = None
-    if hist is not None and not hist.empty and "volume" in hist.columns:
-        v = pd.to_numeric(hist["volume"], errors="coerce").dropna()
-        if not v.empty:
-            latest_volume = float(v.iloc[-1])
-            avg_volume_20d = float(v.tail(20).mean()) if len(v) >= 20 else None
+    avg_volume_20d = None
+    latest_volume = None
+    if hist is not None and not hist.empty:
+        if "volume" in hist.columns:
+            v = pd.to_numeric(hist["volume"], errors="coerce").dropna()
+            if not v.empty:
+                latest_volume = float(v.iloc[-1])
+                if len(v) >= 20:
+                    avg_volume_20d = float(v.tail(20).mean())
     add("Momentum", "Latest Volume", latest_volume, "shares", source="Naver Finance")
     add("Momentum", "20D Average Volume", avg_volume_20d, "shares", source="Naver Finance")
 
-    add("Risk / Accounting", "Receivable Growth vs Sales Growth", None, "pp", "PENDING", "Needs multi-year statements")
-    add("Risk / Accounting", "Inventory Growth vs Sales Growth", None, "pp", "PENDING", "Needs multi-year statements")
-    add("Risk / Accounting", "CFO - Net Income", cfo - net_income if cfo is not None and net_income is not None else None, "KRW million")
+    add("Risk / Accounting", "Receivable Growth vs Sales Growth", None, "pp", "PENDING", "Requires multi-year statement panel mapping")
+    add("Risk / Accounting", "Inventory Growth vs Sales Growth", None, "pp", "PENDING", "Requires multi-year statement panel mapping")
+    add("Risk / Accounting", "CFO - Net Income", (cfo - net_income) if cfo is not None and net_income is not None else None, "KRW million")
     add("Risk / Accounting", "Debt", debt, "KRW million")
-    add("Risk / Accounting", "Recent High-Risk Filings", _count_high_risk_notices(notices), "count", source="OpenDART")
+    add("Risk / Accounting", "Recent High-Risk Filings", int(_count_high_risk_notices(notices)), "count", source="OpenDART")
 
-    # Macro features
-    base, base_t = _series_last(macro, "base_rate")
-    ktb3, ktb3_t = _series_last(macro, "ktb_3y")
-    ktb10, ktb10_t = _series_last(macro, "ktb_10y")
-    usd, usd_t = _series_last(macro, "usdkrw")
-    cpi, cpi_t = _series_last(macro, "cpi")
-    gdp, gdp_t = _series_last(macro, "gdp_real")
-
-    spread = ktb10 - ktb3 if ktb10 is not None and ktb3 is not None else None
-    cpi_yoy = _yoy(_series_df(macro, "cpi"))
-    gdp_yoy = _yoy(_series_df(macro, "gdp_real"))
-
-    macro_items = [
-        ("Policy Rate", base, "%", base_t),
-        ("KTB 3Y", ktb3, "%", ktb3_t),
-        ("KTB 10Y", ktb10, "%", ktb10_t),
-        ("10Y - 3Y Spread", spread, "%p", ktb10_t),
-        ("USD/KRW", usd, "KRW/USD", usd_t),
-        ("CPI Index", cpi, "index", cpi_t),
-        ("CPI YoY", cpi_yoy, "%", cpi_t),
-        ("Real GDP", gdp, "level", gdp_t),
-        ("Real GDP YoY", gdp_yoy, "%", gdp_t),
-    ]
-    for feature, value, unit, obs in macro_items:
-        add("Macro", feature, value, unit, "OK" if value is not None else "PENDING", "ECOS")
-    add("Macro", "Base Rate Observation", base_t, "", source="ECOS")
-
-    add("Industry", "Industry / Sector Code", company_info.get("induty_code") or company_info.get("industry_code"), "", source="OpenDART/company info")
+    # ECOS data is normalized by ECOSClient into macro["series"].
+    macro_rate = None
+    macro_rate_date = None
+    market_rate_rows = []
+    if macro:
+        try:
+            series = macro.get("series", {})
+            base_rows = series.get("base_rate", [])
+            if base_rows:
+                last = base_rows[-1]
+                macro_rate = last.get("DATA_VALUE")
+                macro_rate_date = last.get("TIME")
+            market_rate_rows = series.get("market_rates", [])
+        except Exception:
+            pass
+    add("Macro", "Policy Rate", macro_rate, "%", source="ECOS")
+    add("Macro", "Policy Rate Observation", macro_rate_date, "", source="ECOS")
+    add("Macro", "Market Rate Series Rows", len(market_rate_rows), "rows", source="ECOS")
+    add("Industry", "Industry / Sector", company_info.get("induty_code") or company_info.get("industry_code"), "", source="OpenDART/company info")
     add("Company", "Fiscal Year", company_info.get("acc_mt"), "", source="OpenDART")
     add("Company", "Employees", company_info.get("emp_stdn_nb"), "people", source="OpenDART")
 
     return pd.DataFrame(rows)
 
 
-def _count_high_risk_notices(notices):
+def _count_high_risk_notices(notices: pd.DataFrame) -> int:
     if notices is None or notices.empty or "report_nm" not in notices.columns:
         return 0
     keywords = ["유상증자", "전환사채", "횡령", "배임", "소송", "감사의견", "관리종목", "상장폐지"]
-    return int(notices["report_nm"].astype(str).str.contains("|".join(keywords), case=False, na=False).sum())
+    s = notices["report_nm"].astype(str)
+    return int(s.str.contains("|".join(keywords), case=False, na=False).sum())
